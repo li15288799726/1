@@ -73,3 +73,4 @@ curl -X POST http://localhost:8000/api/chat/qa-tester/config \
 - `.env` — API Key 等环境变量
 
 支持的 Provider 映射见 `server.py` 中 `PROVIDER_ENV_MAP`。
+
