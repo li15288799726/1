@@ -334,6 +334,97 @@ body {
   .board-columns { grid-template-columns:1fr; }
   .header,.stats-row,.board-section,.activity-section { padding-left:16px; padding-right:16px; }
 }
+
+/* ── Pipeline Panel ── */
+.pipeline-panel {
+  position:fixed; top:0; right:0; width:520px; height:100vh;
+  background:var(--bg-secondary); border-left:1px solid var(--border);
+  display:flex; flex-direction:column; z-index:200;
+  transform:translateX(100%); transition:transform .3s cubic-bezier(.4,0,.2,1);
+}
+.pipeline-panel.open { transform:translateX(0); }
+.pipeline-header {
+  padding:20px 24px 16px; border-bottom:1px solid var(--border);
+  display:flex; align-items:center; justify-content:space-between; flex-shrink:0;
+}
+.pipeline-header h2 { font-size:14px; font-weight:600; color:var(--text-primary); margin:0; }
+.pipeline-close { background:none; border:none; color:var(--text-dim); cursor:pointer; font-size:18px; line-height:1; }
+.pipeline-input-area {
+  padding:16px 20px; border-bottom:1px solid var(--border); flex-shrink:0;
+}
+.pipeline-input-row { display:flex; gap:8px; }
+.pipeline-input {
+  flex:1; background:var(--bg-tertiary); border:1px solid var(--border);
+  border-radius:8px; padding:10px 14px; color:var(--text-primary);
+  font-size:13px; outline:none; resize:none; height:60px;
+  font-family:inherit;
+}
+.pipeline-input:focus { border-color:var(--accent-cyan); }
+.pipeline-start-btn {
+  background:linear-gradient(135deg,#6366f1,#22d3ee); border:none;
+  border-radius:8px; color:#fff; font-size:12px; font-weight:600;
+  padding:10px 16px; cursor:pointer; white-space:nowrap; align-self:flex-end;
+}
+.pipeline-start-btn:disabled { opacity:.5; cursor:not-allowed; }
+.pipeline-feed {
+  flex:1; overflow-y:auto; padding:16px 20px;
+  display:flex; flex-direction:column; gap:10px;
+}
+.pipeline-placeholder {
+  text-align:center; color:var(--text-dim); font-size:13px; margin-top:60px;
+}
+.pipeline-placeholder .pl-icon { font-size:40px; margin-bottom:12px; }
+/* step card */
+.pl-step {
+  border-radius:10px; border:1px solid var(--border);
+  background:var(--bg-tertiary); overflow:hidden;
+  animation: plFadeIn .3s ease;
+}
+@keyframes plFadeIn { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:none} }
+.pl-step-head {
+  display:flex; align-items:center; gap:10px; padding:12px 14px;
+  cursor:pointer; user-select:none;
+}
+.pl-step-icon { font-size:18px; flex-shrink:0; }
+.pl-step-meta { flex:1; min-width:0; }
+.pl-step-label { font-size:12px; color:var(--text-dim); }
+.pl-step-name  { font-size:13px; font-weight:600; color:var(--text-primary); }
+.pl-step-status { font-size:11px; padding:3px 8px; border-radius:12px; flex-shrink:0; font-weight:600; }
+.pl-step-status.running  { background:rgba(99,102,241,.2); color:#818cf8; }
+.pl-step-status.done     { background:rgba(52,211,153,.15); color:#34d399; }
+.pl-step-status.error    { background:rgba(239,68,68,.15); color:#f87171; }
+.pl-step-status.pending  { background:rgba(255,255,255,.05); color:var(--text-dim); }
+.pl-step-body { padding:0 14px 12px; }
+.pl-step-output {
+  background:var(--bg-primary); border-radius:6px; padding:10px 12px;
+  font-size:12px; color:var(--text-secondary); white-space:pre-wrap;
+  word-break:break-word; max-height:280px; overflow-y:auto; line-height:1.6;
+}
+.pl-step-spinner { display:inline-block; animation:spin 1s linear infinite; }
+@keyframes spin { to{transform:rotate(360deg)} }
+/* rework badge */
+.pl-rework-badge {
+  background:rgba(251,191,36,.15); border:1px solid rgba(251,191,36,.3);
+  border-radius:8px; padding:8px 14px; font-size:12px; color:#fbbf24;
+  display:flex; align-items:center; gap:8px;
+}
+/* final done */
+.pl-done-banner {
+  background:linear-gradient(135deg,rgba(52,211,153,.12),rgba(99,102,241,.12));
+  border:1px solid rgba(52,211,153,.3); border-radius:10px;
+  padding:14px 16px; font-size:12px; color:#34d399; font-weight:600;
+  display:flex; align-items:center; gap:10px;
+}
+.pipeline-history { padding:10px 20px 0; flex-shrink:0; }
+.pipeline-history-title { font-size:11px; color:var(--text-dim); text-transform:uppercase; margin-bottom:6px; }
+.pipeline-history-list { display:flex; flex-direction:column; gap:4px; max-height:90px; overflow-y:auto; }
+.pl-hist-item {
+  font-size:11px; color:var(--text-secondary); padding:4px 8px;
+  border-radius:6px; cursor:pointer; display:flex; align-items:center; gap:6px;
+}
+.pl-hist-item:hover { background:var(--bg-tertiary); }
+.pl-hist-dot { width:6px; height:6px; border-radius:50%; flex-shrink:0; }
+
 </style>
 </head>
 <body>
@@ -347,6 +438,7 @@ body {
     <span id="task-count">0 个任务</span>
     <span id="agent-count">9 个Agent</span>
     <button class="btn-chat-toggle" id="chatToggle" onclick="toggleChat()">💬 聊天</button>
+    <button class="btn-chat-toggle" id="pipelineToggle" onclick="togglePipeline()" style="background:linear-gradient(135deg,rgba(99,102,241,.15),rgba(34,211,238,.15));border-color:rgba(99,102,241,.4)">🤖 自动流水线</button>
   </div>
 </div>
 
@@ -1096,6 +1188,282 @@ async function saveSettings() {
   const t1 = setInterval(() => { prog += 2; bar.style.width = Math.min(prog,100)+'%'; }, 100);
   setTimeout(() => { clearInterval(t1); loop(); }, REFRESH_MS);
 })();
+</script>
+
+<!-- Pipeline Panel -->
+<div class="pipeline-panel" id="pipelinePanel">
+  <div class="pipeline-header">
+    <h2>🤖 自动多Agent流水线</h2>
+    <button class="pipeline-close" onclick="togglePipeline()">✕</button>
+  </div>
+  <div class="pipeline-history" id="plHistorySection" style="display:none">
+    <div class="pipeline-history-title">历史流水线</div>
+    <div class="pipeline-history-list" id="plHistoryList"></div>
+  </div>
+  <div class="pipeline-input-area">
+    <div class="pipeline-input-row">
+      <textarea class="pipeline-input" id="plGoalInput"
+        placeholder="输入目标，例如：帮我做一个网页版的五子棋游戏"
+        onkeydown="if(event.ctrlKey&&event.key==='Enter')startPipeline()"></textarea>
+      <button class="pipeline-start-btn" id="plStartBtn" onclick="startPipeline()">▶ 启动</button>
+    </div>
+  </div>
+  <div class="pipeline-feed" id="plFeed">
+    <div class="pipeline-placeholder">
+      <div class="pl-icon">🤖</div>
+      <div>输入目标，点击启动</div>
+      <div style="margin-top:6px;font-size:11px">team-lead → 各角色自动分工 → 验收 → 交付</div>
+    </div>
+  </div>
+</div>
+
+<script>
+
+// ═══════════════════════════════════════════
+// Pipeline Engine — Frontend
+// ═══════════════════════════════════════════
+let _plOpen      = false;
+let _plCurrentId = null;
+let _plEvtSource = null;
+let _plSteps     = {};   // step_index → dom element
+let _plHistory   = [];
+
+function togglePipeline() {
+  _plOpen = !_plOpen;
+  document.getElementById('pipelinePanel').classList.toggle('open', _plOpen);
+  document.getElementById('pipelineToggle').classList.toggle('active', _plOpen);
+  if (_plOpen) loadPipelineHistory();
+}
+
+async function loadPipelineHistory() {
+  try {
+    const rows = await fetch('/api/pipelines').then(r=>r.json());
+    _plHistory = rows;
+    const sec  = document.getElementById('plHistorySection');
+    const list = document.getElementById('plHistoryList');
+    if (!rows.length) { sec.style.display='none'; return; }
+    sec.style.display = '';
+    list.innerHTML = rows.slice(0,6).map(p=>`
+      <div class="pl-hist-item" onclick="loadPipeline('${p.id}','${escHtml(p.goal)}')">
+        <div class="pl-hist-dot" style="background:${p.status==='done'?'#34d399':'#6366f1'}"></div>
+        <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(p.goal)}</span>
+        <span style="color:var(--text-dim)">${p.status==='done'?'✓':'…'}</span>
+      </div>`).join('');
+  } catch(e) { console.error(e); }
+}
+
+async function loadPipeline(id, goal) {
+  _plCurrentId = id;
+  resetFeed();
+  document.getElementById('plGoalInput').value = goal;
+  closePrevStream();
+  // fetch existing steps
+  try {
+    const data = await fetch(`/api/pipeline/${id}/status`).then(r=>r.json());
+    for (const s of data.steps || []) {
+      if (s.status === 'done') renderStepDone(s.step_index, s.agent_id, '', s.output, true);
+    }
+    if (data.status === 'done') {
+      appendDoneBanner(data.steps?.slice(-1)[0]?.output || '');
+    }
+  } catch(e) {}
+}
+
+async function startPipeline() {
+  const goal = document.getElementById('plGoalInput').value.trim();
+  if (!goal) return;
+  resetFeed();
+  document.getElementById('plStartBtn').disabled = true;
+  closePrevStream();
+
+  try {
+    const res = await fetch('/api/pipeline/start',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({goal})
+    }).then(r=>r.json());
+
+    if (!res.success) { alert('启动失败: ' + res.error); return; }
+    _plCurrentId = res.pipeline_id;
+    openStream(res.stream_url);
+  } catch(e) {
+    alert('请求失败: ' + e.message);
+    document.getElementById('plStartBtn').disabled = false;
+  }
+}
+
+function openStream(url) {
+  const es = new EventSource(url);
+  _plEvtSource = es;
+
+  es.onmessage = e => {
+    const ev = JSON.parse(e.data);
+    handlePipelineEvent(ev);
+  };
+  es.onerror = () => {
+    // SSE 关闭后自动重连会失败，忽略即可
+    es.close();
+    document.getElementById('plStartBtn').disabled = false;
+  };
+}
+
+function closePrevStream() {
+  if (_plEvtSource) { _plEvtSource.close(); _plEvtSource = null; }
+}
+
+function handlePipelineEvent(ev) {
+  const feed = document.getElementById('plFeed');
+  // 清掉 placeholder
+  const ph = feed.querySelector('.pipeline-placeholder');
+  if (ph) ph.remove();
+
+  switch(ev.type) {
+    case 'start':
+      appendGoalBadge(ev.goal, ev.total_steps);
+      break;
+    case 'meta':
+      appendGoalBadge(ev.goal);
+      break;
+    case 'step_start':
+      renderStepStart(ev.step_index, ev.agent_id, ev.agent_name, ev.agent_icon, ev.label);
+      break;
+    case 'step_done':
+      renderStepDone(ev.step_index, ev.agent_id, ev.agent_name||'', ev.output, ev.success);
+      break;
+    case 'rework':
+      appendReworkBadge(ev.reason);
+      break;
+    case 'done':
+      appendDoneBanner(ev.final_output);
+      document.getElementById('plStartBtn').disabled = false;
+      loadPipelineHistory();
+      break;
+    case 'heartbeat': break;
+  }
+}
+
+function appendGoalBadge(goal, total) {
+  const feed = document.getElementById('plFeed');
+  const d = document.createElement('div');
+  d.style.cssText = 'background:rgba(99,102,241,.12);border:1px solid rgba(99,102,241,.3);border-radius:10px;padding:12px 14px;font-size:12px;color:#818cf8;';
+  d.innerHTML = `<b>🎯 目标：</b>${escHtml(goal)}` + (total?` <span style="color:var(--text-dim)">(共 ${total} 步)</span>`:'');
+  feed.appendChild(d);
+  feed.scrollTop = feed.scrollHeight;
+}
+
+function renderStepStart(idx, agentId, name, icon, label) {
+  const feed = document.getElementById('plFeed');
+  const card = document.createElement('div');
+  card.className = 'pl-step';
+  card.id = `pl-step-${idx}`;
+  const agentColor = getAgentColor(agentId);
+  card.innerHTML = `
+    <div class="pl-step-head" onclick="toggleStepBody(${idx})">
+      <div class="pl-step-icon">${icon||'🤖'}</div>
+      <div class="pl-step-meta">
+        <div class="pl-step-label">${escHtml(label||'')}</div>
+        <div class="pl-step-name" style="color:${agentColor}">${escHtml(name||agentId)}</div>
+      </div>
+      <span class="pl-step-status running"><span class="pl-step-spinner">⟳</span> 执行中</span>
+    </div>
+    <div class="pl-step-body" id="pl-step-body-${idx}" style="display:none">
+      <div class="pl-step-output" id="pl-step-out-${idx}">正在思考…</div>
+    </div>`;
+  _plSteps[idx] = card;
+  feed.appendChild(card);
+  feed.scrollTop = feed.scrollHeight;
+}
+
+function renderStepDone(idx, agentId, name, output, success) {
+  let card = _plSteps[idx] || document.getElementById(`pl-step-${idx}`);
+  if (!card) {
+    // 历史回放时直接创建
+    const feed = document.getElementById('plFeed');
+    card = document.createElement('div');
+    card.className = 'pl-step'; card.id = `pl-step-${idx}`;
+    const am = getAgentMeta(agentId);
+    card.innerHTML = `
+      <div class="pl-step-head" onclick="toggleStepBody(${idx})">
+        <div class="pl-step-icon">${am.icon}</div>
+        <div class="pl-step-meta">
+          <div class="pl-step-label">步骤 ${idx+1}</div>
+          <div class="pl-step-name" style="color:${am.color}">${am.name}</div>
+        </div>
+        <span class="pl-step-status ${success?'done':'error'}">${success?'✓ 完成':'✗ 错误'}</span>
+      </div>
+      <div class="pl-step-body" id="pl-step-body-${idx}" style="display:none">
+        <div class="pl-step-output" id="pl-step-out-${idx}"></div>
+      </div>`;
+    _plSteps[idx] = card;
+    feed.appendChild(card);
+  } else {
+    const statusEl = card.querySelector('.pl-step-status');
+    if (statusEl) {
+      statusEl.className = `pl-step-status ${success?'done':'error'}`;
+      statusEl.textContent = success ? '✓ 完成' : '✗ 错误';
+    }
+  }
+  const outEl = document.getElementById(`pl-step-out-${idx}`);
+  if (outEl) outEl.textContent = output || '';
+  // 自动展开最后完成的步骤
+  const body = document.getElementById(`pl-step-body-${idx}`);
+  if (body) body.style.display = '';
+  document.getElementById('plFeed').scrollTop = 99999;
+}
+
+function toggleStepBody(idx) {
+  const body = document.getElementById(`pl-step-body-${idx}`);
+  if (body) body.style.display = body.style.display==='none' ? '' : 'none';
+}
+
+function appendReworkBadge(reason) {
+  const feed = document.getElementById('plFeed');
+  const d = document.createElement('div');
+  d.className = 'pl-rework-badge';
+  d.innerHTML = `⚠️ <span>${escHtml(reason)}</span>`;
+  feed.appendChild(d);
+  feed.scrollTop = feed.scrollHeight;
+}
+
+function appendDoneBanner(finalOutput) {
+  const feed = document.getElementById('plFeed');
+  const d = document.createElement('div');
+  d.className = 'pl-done-banner';
+  d.innerHTML = `✅ <span>流水线完成！全部 Agent 已交付。</span>`;
+  feed.appendChild(d);
+  feed.scrollTop = feed.scrollHeight;
+}
+
+function resetFeed() {
+  _plSteps = {};
+  const feed = document.getElementById('plFeed');
+  feed.innerHTML = '';
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+const AGENT_COLORS = {
+  'team-lead':'#fbbf24','project-director':'#f97316','product-manager':'#6366f1',
+  'designer':'#22d3ee','architect':'#34d399','frontend-engineer':'#14b8a6',
+  'backend-engineer':'#a78bfa','qa-tester':'#eab308','devops':'#ec4899'
+};
+const AGENT_ICONS  = {
+  'team-lead':'👑','project-director':'🎯','product-manager':'📋',
+  'designer':'🎨','architect':'🏗️','frontend-engineer':'⚛️',
+  'backend-engineer':'⚙️','qa-tester':'🧪','devops':'🐳'
+};
+const AGENT_NAMES  = {
+  'team-lead':'负责人','project-director':'项目总监','product-manager':'产品经理',
+  'designer':'设计师','architect':'架构师','frontend-engineer':'前端工程师',
+  'backend-engineer':'后端工程师','qa-tester':'测试工程师','devops':'运维'
+};
+function getAgentColor(id) { return AGENT_COLORS[id] || '#818cf8'; }
+function getAgentMeta(id)  {
+  return { icon:AGENT_ICONS[id]||'🤖', name:AGENT_NAMES[id]||id, color:AGENT_COLORS[id]||'#818cf8' };
+}
+function escHtml(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
 </script>
 </body>
 </html>
