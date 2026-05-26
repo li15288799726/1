@@ -285,35 +285,98 @@ def append_chat_message(agent_id: str, role: str, content: str) -> None:
 
 # ─── Hermes CLI ───────────────────────────────────────────────────────────────
 
-_HERMES_BIN: str | None = None
+# ─── 直接调 LLM API（不依赖 hermes CLI）───────────────────────────────────────
 
-def get_hermes_bin() -> str:
-    global _HERMES_BIN
-    if _HERMES_BIN is None:
-        for p in os.environ.get("PATH","").split(os.pathsep):
-            c = os.path.join(p, "hermes")
-            if os.path.isfile(c) and os.access(c, os.X_OK):
-                _HERMES_BIN = c; break
-        if _HERMES_BIN is None: _HERMES_BIN = "hermes"
-    return _HERMES_BIN
+import urllib.request as _urllib_req
 
-def _run_hermes(agent_id: str, prompt: str) -> tuple[bool, str]:
-    """调用 hermes CLI，返回 (success, response)"""
+AGENT_SYSTEM_PROMPTS = {
+    "team-lead":         "你是团队负责人（Team Lead），负责理解目标、拆解任务、协调各方、最终验收和汇总交付。语言简洁，决策果断。",
+    "project-director":  "你是项目总监（Project Director），负责制定项目计划、里程碑、风险管控和最终验收。注重可执行性和质量把控。",
+    "product-manager":   "你是产品经理（Product Manager），负责用户需求分析、功能定义、原型描述和验收标准制定。从用户角度出发，需求具体可落地。",
+    "designer":          "你是UI/UX设计师（Designer），负责视觉设计、配色、布局和交互动效。输出具体色值和CSS要点，前端可直接参考实现。",
+    "architect":         "你是系统架构师（Architect），负责技术选型、模块划分、数据结构设计和关键算法选择。输出足够具体，让工程师直接按此开发。",
+    "frontend-engineer": "你是前端工程师（Frontend Engineer），擅长HTML/CSS/JavaScript，负责实现完整可运行的前端代码。直接输出完整代码。",
+    "backend-engineer":  "你是后端工程师（Backend Engineer），负责API设计、业务逻辑和数据库操作。直接输出完整可运行代码，包含依赖说明。",
+    "qa-tester":         "你是测试工程师（QA Tester），负责测试用例编写、代码审查、Bug发现和质量评估。严格专业，发现真实问题。",
+    "devops":            "你是运维工程师（DevOps），负责部署方案、CI/CD配置、监控告警和容器化。注重可操作性和稳定性。",
+}
+
+def _get_agent_key_and_cfg(agent_id: str):
+    """返回 (api_key, provider, base_url, model_id)"""
+    cfg      = get_agent_config(agent_id)
+    provider = cfg.get("provider", "deepseek")
+    base_url = cfg.get("base_url", "https://api.deepseek.com")
+    model_id = cfg.get("model_id", "deepseek-chat")
+    env_path = os.path.join(get_agent_profile_dir(agent_id), ".env")
+    api_key  = ""
+    if os.path.isfile(env_path):
+        expected_var = PROVIDER_ENV_MAP.get(provider, "CUSTOM_API_KEY")
+        lines = open(env_path).readlines()
+        for line in lines:
+            line = line.strip()
+            if line.startswith(expected_var + "="):
+                api_key = line.split("=", 1)[1].strip().strip("\"'"); break
+        if not api_key:
+            for line in lines:
+                line = line.strip()
+                if "API_KEY" in line and "=" in line and not line.startswith("#"):
+                    v = line.split("=", 1)[1].strip().strip("\"'")
+                    if v: api_key = v; break
+    if not api_key:
+        env_var = PROVIDER_ENV_MAP.get(provider, "")
+        if env_var: api_key = os.environ.get(env_var, "")
+    return api_key, provider, base_url, model_id
+
+
+def _call_anthropic_api(api_key: str, model_id: str, messages: list) -> tuple:
+    system = ""; filtered = []
+    for m in messages:
+        if m["role"] == "system": system = m["content"]
+        else: filtered.append(m)
+    payload = json.dumps({"model": model_id, "max_tokens": 4096,
+                          "system": system, "messages": filtered}).encode()
+    req = _urllib_req.Request("https://api.anthropic.com/v1/messages", data=payload,
+        headers={"Content-Type":"application/json","x-api-key":api_key,
+                 "anthropic-version":"2023-06-01"}, method="POST")
     try:
-        proc = subprocess.run(
-            [get_hermes_bin(), "--yolo", "-p", agent_id, "chat", "-q", prompt, "--quiet"],
-            capture_output=True, text=True, timeout=180,
-            env={**os.environ, "HERMES_QUIET": "1", "TERM": "dumb"})
-        response = proc.stdout.strip() or proc.stderr.strip() or "(Agent 无响应)"
-        for pat in [r"^\s*━━━.*━━━\s*$", r"^\s*─+.*─+\s*$",
-                    r"^✦\s+.*", r"^╭─.*", r"^╰─.*", r"^│.*"]:
-            response = re.sub(pat, "", response, flags=re.MULTILINE)
-        response = re.sub(r"^session_id:\s+\S+\s*\n?", "", response).strip()
-        return proc.returncode == 0 and bool(response), response
-    except subprocess.TimeoutExpired:
-        return False, f"(⏱️ {agent_id} 超时 180s)"
+        with _urllib_req.urlopen(req, timeout=120) as r:
+            data = json.loads(r.read())
+        return True, data["content"][0]["text"].strip()
+    except _urllib_req.HTTPError as e:
+        return False, f"Anthropic API {e.code}: {e.read().decode(errors='replace')[:200]}"
     except Exception as e:
-        return False, f"(❌ {e})"
+        return False, f"Error: {e}"
+
+
+def _run_hermes(agent_id: str, prompt: str) -> tuple:
+    """调用该 Agent 配置的 LLM API，返回 (success, response)"""
+    api_key, provider, base_url, model_id = _get_agent_key_and_cfg(agent_id)
+    if not api_key:
+        name = AGENT_META.get(agent_id, {}).get("name", agent_id)
+        return False, f"⚠️ {name} 未配置 API Key，请在 Agent 设置中配置。"
+
+    system_prompt = AGENT_SYSTEM_PROMPTS.get(agent_id, "你是一个专业的AI助手。")
+    messages = [{"role":"system","content":system_prompt},
+                {"role":"user","content":prompt}]
+
+    if provider == "anthropic":
+        return _call_anthropic_api(api_key, model_id, messages)
+
+    endpoint = base_url.rstrip("/") + "/chat/completions"
+    payload  = json.dumps({"model":model_id,"messages":messages,
+                           "max_tokens":4096,"temperature":0.7}).encode()
+    req = _urllib_req.Request(endpoint, data=payload,
+        headers={"Content-Type":"application/json",
+                 "Authorization":f"Bearer {api_key}"}, method="POST")
+    try:
+        with _urllib_req.urlopen(req, timeout=120) as r:
+            data = json.loads(r.read())
+        return True, data["choices"][0]["message"]["content"].strip()
+    except _urllib_req.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        return False, f"API {e.code}: {body[:300]}"
+    except Exception as e:
+        return False, f"Error: {e}"
 
 
 def call_agent(agent_id: str, user_message: str) -> dict:
