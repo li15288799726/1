@@ -711,6 +711,149 @@ function clearMessages() {
 }
 
 // ─── Chat API ───
+// ─── Team-Lead SSE 分工相关 ─────────────────────────────────────────────────
+let _tlEvtSource = null;
+
+const AGENT_META_JS = {
+  'team-lead':        {name:'负责人',    icon:'👑', color:'#fbbf24'},
+  'project-director': {name:'项目总监',  icon:'🎯', color:'#f97316'},
+  'product-manager':  {name:'产品经理',  icon:'📋', color:'#6366f1'},
+  'designer':         {name:'设计师',    icon:'🎨', color:'#22d3ee'},
+  'architect':        {name:'架构师',    icon:'🏗️', color:'#34d399'},
+  'frontend-engineer':{name:'前端工程师',icon:'⚛️', color:'#14b8a6'},
+  'backend-engineer': {name:'后端工程师',icon:'⚙️', color:'#a78bfa'},
+  'qa-tester':        {name:'测试工程师',icon:'🧪', color:'#eab308'},
+  'devops':           {name:'运维',      icon:'🐳', color:'#ec4899'},
+};
+
+function addDelegationCard(sessionId, goal, total) {
+  const msgs = document.getElementById('chatMessages');
+  const card = document.createElement('div');
+  card.id = 'tl-card-' + sessionId;
+  card.className = 'chat-msg agent';
+  card.style.cssText = 'padding:0;background:transparent;border:none;';
+  card.innerHTML = `
+    <div style="background:var(--bg-tertiary);border:1px solid var(--border);border-radius:10px;overflow:hidden;">
+      <div style="padding:12px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;">
+        <span style="font-size:16px">👑</span>
+        <div style="flex:1">
+          <div style="font-size:11px;color:var(--text-dim)">自动分工协作中</div>
+          <div style="font-size:13px;font-weight:600;color:#fbbf24">${esc(goal)}</div>
+        </div>
+        <span id="tl-total-${sessionId}" style="font-size:11px;color:var(--text-dim)">0 / ${total||'?'} 步</span>
+      </div>
+      <div id="tl-steps-${sessionId}" style="padding:10px 14px;display:flex;flex-direction:column;gap:6px;max-height:400px;overflow-y:auto;"></div>
+      <div id="tl-final-${sessionId}" style="display:none;padding:12px 14px;border-top:1px solid var(--border);"></div>
+    </div>`;
+  msgs.appendChild(card);
+  scrollToBottom();
+  return card;
+}
+
+function addDelegationStep(sessionId, step, total, agentId, agentName, agentIcon, agentColor, label, status, output) {
+  const stepsEl = document.getElementById('tl-steps-' + sessionId);
+  if (!stepsEl) return;
+
+  const totalEl = document.getElementById('tl-total-' + sessionId);
+  if (totalEl) totalEl.textContent = (step+1) + ' / ' + total + ' 步';
+
+  let rowEl = document.getElementById('tl-step-' + sessionId + '-' + step);
+  if (!rowEl) {
+    rowEl = document.createElement('div');
+    rowEl.id = 'tl-step-' + sessionId + '-' + step;
+    rowEl.style.cssText = 'border-radius:8px;border:1px solid var(--border);background:var(--bg-primary);overflow:hidden;';
+    rowEl.innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px;padding:8px 10px;cursor:pointer;"
+           onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'':'none'">
+        <span style="font-size:15px">${agentIcon}</span>
+        <div style="flex:1;min-width:0">
+          <div style="font-size:11px;color:var(--text-dim)">${esc(label)}</div>
+          <div style="font-size:12px;font-weight:600;color:${agentColor}">${esc(agentName)}</div>
+        </div>
+        <span id="tl-step-status-${sessionId}-${step}" style="font-size:11px;padding:2px 7px;border-radius:10px;background:rgba(99,102,241,.2);color:#818cf8;">
+          ⟳ 执行中
+        </span>
+      </div>
+      <div id="tl-step-out-${sessionId}-${step}" style="display:none;padding:0 10px 10px;">
+        <div style="background:var(--bg-secondary);border-radius:6px;padding:8px 10px;font-size:11px;color:var(--text-secondary);white-space:pre-wrap;max-height:200px;overflow-y:auto;line-height:1.5;"></div>
+      </div>`;
+    stepsEl.appendChild(rowEl);
+    stepsEl.scrollTop = stepsEl.scrollHeight;
+  }
+
+  if (status === 'done' && output) {
+    const statusEl = document.getElementById('tl-step-status-' + sessionId + '-' + step);
+    if (statusEl) { statusEl.style.background='rgba(52,211,153,.15)'; statusEl.style.color='#34d399'; statusEl.textContent='✓ 完成'; }
+    const outWrap = document.getElementById('tl-step-out-' + sessionId + '-' + step);
+    if (outWrap) {
+      outWrap.querySelector('div').textContent = output;
+      outWrap.style.display = '';  // auto-expand last done step
+    }
+  }
+  scrollToBottom();
+}
+
+function finalizeDelegation(sessionId, finalText) {
+  const finalEl = document.getElementById('tl-final-' + sessionId);
+  if (!finalEl) return;
+  finalEl.style.display = '';
+  finalEl.innerHTML = `
+    <div style="font-size:11px;color:#34d399;font-weight:600;margin-bottom:6px;">✅ 负责人交付报告</div>
+    <div style="font-size:12px;color:var(--text-secondary);white-space:pre-wrap;line-height:1.6;max-height:300px;overflow-y:auto;">${esc(finalText)}</div>`;
+  scrollToBottom();
+}
+
+function openDelegationStream(sessionId, goal, streamUrl) {
+  if (_tlEvtSource) _tlEvtSource.close();
+  let total = 0, cardCreated = false;
+
+  const es = new EventSource(streamUrl);
+  _tlEvtSource = es;
+
+  es.onmessage = e => {
+    const ev = JSON.parse(e.data);
+    if (ev.type === 'heartbeat') return;
+
+    if (ev.type === 'start') {
+      total = ev.total || 0;
+      addDelegationCard(sessionId, goal, total);
+      cardCreated = true;
+    }
+    if ((ev.type === 'step_start' || ev.type === 'step_done') && !cardCreated) {
+      addDelegationCard(sessionId, goal, ev.total || '?');
+      cardCreated = true;
+    }
+    if (ev.type === 'step_start') {
+      addDelegationStep(sessionId, ev.step, ev.total, ev.agent_id, ev.agent_name, ev.agent_icon, ev.agent_color, ev.label, 'running', '');
+    }
+    if (ev.type === 'step_done') {
+      addDelegationStep(sessionId, ev.step, ev.total, ev.agent_id, ev.agent_name, ev.agent_icon, ev.agent_color, ev.label, 'done', ev.output);
+    }
+    if (ev.type === 'rework') {
+      const stepsEl = document.getElementById('tl-steps-' + sessionId);
+      if (stepsEl) {
+        const badge = document.createElement('div');
+        badge.style.cssText = 'background:rgba(251,191,36,.1);border:1px solid rgba(251,191,36,.3);border-radius:6px;padding:6px 10px;font-size:11px;color:#fbbf24;';
+        badge.textContent = '⚠️ ' + (ev.reason || '验收未通过，自动返工');
+        stepsEl.appendChild(badge);
+      }
+    }
+    if (ev.type === 'done') {
+      finalizeDelegation(sessionId, ev.final || '');
+      es.close();
+      isLoading = false;
+      document.getElementById('chatSendBtn').disabled = false;
+      document.getElementById('chatInput').focus();
+    }
+  };
+
+  es.onerror = () => {
+    es.close();
+    isLoading = false;
+    document.getElementById('chatSendBtn').disabled = false;
+  };
+}
+
 async function sendMessage() {
   if (isLoading) return;
   const input = document.getElementById('chatInput');
@@ -721,11 +864,7 @@ async function sendMessage() {
   isLoading = true;
   document.getElementById('chatSendBtn').disabled = true;
 
-  // Show user message
   addMessage('user', text, currentAgent);
-
-  // Show loading
-  addLoading();
 
   try {
     const res = await fetch('/api/chat/' + currentAgent, {
@@ -734,7 +873,13 @@ async function sendMessage() {
       body: JSON.stringify({message: text})
     });
     const data = await res.json();
-    removeLoading();
+
+    // team-lead 自动分工模式
+    if (data.delegating && data.stream_url) {
+      openDelegationStream(data.session_id, text, data.stream_url);
+      // isLoading / disabled 由 SSE done 事件解锁
+      return;
+    }
 
     if (data.response) {
       addMessage('agent', data.response, currentAgent, true);
@@ -742,7 +887,6 @@ async function sendMessage() {
       addMessage('agent', '❌ ' + data.error, currentAgent, false);
     }
   } catch(e) {
-    removeLoading();
     addMessage('agent', '❌ 通信错误: ' + e.message, currentAgent, false);
   }
 

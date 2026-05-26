@@ -297,301 +297,241 @@ def get_hermes_bin() -> str:
         if _HERMES_BIN is None: _HERMES_BIN = "hermes"
     return _HERMES_BIN
 
-def call_agent(agent_id: str, user_message: str) -> dict:
-    history  = load_chat_history(agent_id, limit=20)
-    ctx_lines = [f"{'用户' if m['role']=='user' else '助手'}: {m['content'][:500]}" for m in history]
-    context_str = ("以下是本次对话的最近历史记录：\n" + "\n".join(ctx_lines) + "\n\n---\n\n") if ctx_lines else ""
-    full_prompt = context_str + user_message
+def _run_hermes(agent_id: str, prompt: str) -> tuple[bool, str]:
+    """调用 hermes CLI，返回 (success, response)"""
     try:
         proc = subprocess.run(
-            [get_hermes_bin(), "--yolo", "-p", agent_id, "chat", "-q", full_prompt, "--quiet"],
+            [get_hermes_bin(), "--yolo", "-p", agent_id, "chat", "-q", prompt, "--quiet"],
             capture_output=True, text=True, timeout=180,
-            env={**os.environ, "HERMES_QUIET":"1", "TERM":"dumb"})
+            env={**os.environ, "HERMES_QUIET": "1", "TERM": "dumb"})
         response = proc.stdout.strip() or proc.stderr.strip() or "(Agent 无响应)"
-        for pat in [r"^\s*━━━.*━━━\s*$",r"^\s*─+.*─+\s*$",r"^✦\s+.*",r"^╭─.*",r"^╰─.*",r"^│.*"]:
-            response = re.sub(pat,"",response,flags=re.MULTILINE)
-        response = re.sub(r"^session_id:\s+\S+\s*\n?","",response).strip()
-        success  = proc.returncode == 0 and bool(response)
+        for pat in [r"^\s*━━━.*━━━\s*$", r"^\s*─+.*─+\s*$",
+                    r"^✦\s+.*", r"^╭─.*", r"^╰─.*", r"^│.*"]:
+            response = re.sub(pat, "", response, flags=re.MULTILINE)
+        response = re.sub(r"^session_id:\s+\S+\s*\n?", "", response).strip()
+        return proc.returncode == 0 and bool(response), response
     except subprocess.TimeoutExpired:
-        response = f"(⏱️ {agent_id} 超时 180s)"; success = False
+        return False, f"(⏱️ {agent_id} 超时 180s)"
     except Exception as e:
-        response = f"(❌ {e})";                   success = False
+        return False, f"(❌ {e})"
 
+
+def call_agent(agent_id: str, user_message: str) -> dict:
+    """普通调用（非 team-lead 或单条聊天）"""
+    history   = load_chat_history(agent_id, limit=20)
+    ctx_lines = [f"{'用户' if m['role']=='user' else '助手'}: {m['content'][:500]}" for m in history]
+    context_str = ("以下是本次对话的最近历史记录：\n" + "\n".join(ctx_lines) + "\n\n---\n\n") if ctx_lines else ""
+    success, response = _run_hermes(agent_id, context_str + user_message)
     append_chat_message(agent_id, "user",      user_message)
     append_chat_message(agent_id, "assistant", response)
     track_activity(agent_id)
     return {"success": success, "response": response, "agent": agent_id,
-            "agent_name": AGENT_META.get(agent_id,{}).get("name", agent_id)}
+            "agent_name": AGENT_META.get(agent_id, {}).get("name", agent_id)}
+
 
 def forward_to_agent(from_agent: str, to_agent: str, message: str) -> dict:
     if to_agent not in AGENT_IDS:
-        return {"success":False,"response":f"未知目标Agent: {to_agent}","agent":to_agent}
-    from_name = AGENT_META.get(from_agent,{}).get("name", from_agent)
-    to_name   = AGENT_META.get(to_agent,{}).get("name", to_agent)
+        return {"success": False, "response": f"未知目标Agent: {to_agent}", "agent": to_agent}
+    from_name = AGENT_META.get(from_agent, {}).get("name", from_agent)
+    to_name   = AGENT_META.get(to_agent,   {}).get("name", to_agent)
     msg = (f"【任务协调 - 来自 {from_name} → 转交 {to_name}】\n\n"
            f"上游输出：\n{message}\n\n"
-           f"请基于上述信息执行你职责范围内的工作，给出具体方案或产出。"
-           f"如需其他 Agent 协助，请明确指出。")
+           f"请基于上述信息执行你职责范围内的工作，给出具体方案或产出。")
     track_activity(from_agent)
     result = call_agent(to_agent, msg)
     track_activity(to_agent)
     return result
 
-# ─── Autonomous Pipeline Engine ───────────────────────────────────────────────
-#
-# 流程:
-#   team-lead → project-director → product-manager → architect
-#   → [frontend/backend]-engineer → qa-tester
-#   → project-director(审核) → team-lead(汇总)
-#
-# 每个 Agent 收到前序所有输出作为上下文 + 专属角色指令。
-# project-director 审核时若不通过，自动退回 engineer 重做（最多 1 次）。
-# 全程通过 SSE 实时推送进度，不需要任何人工操作。
 
-# 角色指令 — 每步告诉 Agent 它的具体任务
-ROLE_PROMPTS = {
-    "team-lead-start": (
-        "你是团队负责人（Team Lead）。用户提出了以下目标：\n\n"
-        "{goal}\n\n"
-        "请你：\n"
-        "1. 理解并拆解该目标\n"
-        "2. 明确项目范围和核验标准（验收条件）\n"
-        "3. 写一份简明的项目启动令，交给项目总监执行\n"
-        "直接输出启动令内容，不要多余废话。"
+# ─── Team-Lead 自动分工引擎 ───────────────────────────────────────────────────
+#
+# 用户直接跟 team-lead 聊天 → team-lead 自动分工 → 各 Agent 依次完成工作
+# → project-director 验收 → team-lead 汇总回复给用户
+#
+# 所有进度通过 SSE 实时推送到 team-lead 的聊天窗口。
+
+DELEGATION_PROMPTS = {
+    "team-lead-kickoff": (
+        "你是团队负责人（Team Lead）。用户对你提出了以下目标：\n\n"
+        "【用户目标】{goal}\n\n"
+        "请拆解目标，写一份清晰的项目启动令（含范围、验收标准），准备交给项目总监。"
+        "直接输出启动令，不要废话。"
     ),
-    "project-director-plan": (
-        "你是项目总监（Project Director）。收到以下项目启动令：\n\n"
-        "{prev}\n\n"
-        "请制定：\n"
-        "1. 项目阶段划分和里程碑\n"
-        "2. 各角色职责分工\n"
-        "3. 技术风险点和应对策略\n"
-        "输出详细项目计划，供后续各角色参考。"
+    "project-director": (
+        "你是项目总监。收到负责人的启动令：\n\n{prev}\n\n"
+        "请制定：阶段划分、各角色职责、技术风险及应对。"
     ),
     "product-manager": (
-        "你是产品经理（Product Manager）。项目背景如下：\n\n"
-        "{prev}\n\n"
-        "请输出：\n"
-        "1. 用户故事（User Stories）\n"
-        "2. 功能清单（Feature List）\n"
-        "3. 界面原型描述（文字描述即可）\n"
-        "4. 数据结构/状态定义\n"
-        "要具体可执行，工程师能直接据此开发。"
+        "你是产品经理。项目背景：\n\n{prev}\n\n"
+        "请输出：用户故事、功能清单、界面原型描述、数据结构定义。要可直接指导开发。"
     ),
     "architect": (
-        "你是架构师（Architect）。产品需求如下：\n\n"
-        "{prev}\n\n"
-        "请输出：\n"
-        "1. 技术选型（语言、框架、库）\n"
-        "2. 系统模块划分\n"
-        "3. 核心数据结构和算法\n"
-        "4. 文件/目录结构\n"
-        "5. 关键实现要点\n"
-        "要足够具体，让工程师知道怎么写。"
+        "你是架构师。需求如下：\n\n{prev}\n\n"
+        "请输出：技术选型、模块划分、核心数据结构与算法、文件结构、关键实现要点。"
     ),
     "designer": (
-        "你是设计师（Designer）。技术方案如下：\n\n"
-        "{prev}\n\n"
-        "请输出：\n"
-        "1. 配色方案（具体色值）\n"
-        "2. 布局结构说明\n"
-        "3. 交互动效说明\n"
-        "4. 关键 UI 组件的 CSS 样式要点\n"
-        "要足够具体，前端工程师可直接参考实现。"
-    ),
-    "frontend-engineer": (
-        "你是前端工程师（Frontend Engineer）。以下是完整需求和设计：\n\n"
-        "{prev}\n\n"
-        "请直接输出**完整可运行的代码**（单个 HTML 文件，内联 CSS 和 JS）。\n"
-        "要求：\n"
-        "- 代码完整，能直接在浏览器打开运行\n"
-        "- 实现所有核心功能\n"
-        "- 代码简洁，注释清晰\n"
-        "只输出代码块，不要多余说明。"
+        "你是设计师。方案如下：\n\n{prev}\n\n"
+        "请输出：配色方案（具体色值）、布局结构、交互动效、关键 CSS 样式要点。"
     ),
     "backend-engineer": (
-        "你是后端工程师（Backend Engineer）。以下是完整需求和架构：\n\n"
-        "{prev}\n\n"
-        "请直接输出**完整可运行的后端代码**。\n"
-        "要求：\n"
-        "- 代码完整，包含所有依赖说明\n"
-        "- 实现所有核心 API 和业务逻辑\n"
-        "- 代码简洁，注释清晰\n"
-        "只输出代码块，不要多余说明。"
+        "你是后端工程师。需求和架构：\n\n{prev}\n\n"
+        "请直接输出完整可运行的后端代码（含依赖说明）。只输出代码块。"
+    ),
+    "frontend-engineer": (
+        "你是前端工程师。以下是完整需求和设计：\n\n{prev}\n\n"
+        "请直接输出完整可运行的单文件 HTML（内联 CSS+JS），能直接浏览器打开运行。只输出代码块。"
     ),
     "qa-tester": (
-        "你是测试工程师（QA Tester）。以下是项目全部输出：\n\n"
-        "{prev}\n\n"
-        "请：\n"
-        "1. 列出测试用例\n"
-        "2. 检查代码中明显的 Bug 或逻辑错误\n"
-        "3. 指出可改进点\n"
-        "4. 给出总体评价：【通过】或【需整改】，并说明原因\n"
-        "要严格、专业。"
+        "你是测试工程师。项目全部输出：\n\n{prev}\n\n"
+        "请列测试用例、检查明显 Bug、给出总体评价：【通过】或【需整改】。"
     ),
     "project-director-review": (
-        "你是项目总监（Project Director），正在做最终验收。\n\n"
-        "项目目标：{goal}\n\n"
-        "各角色完整输出如下：\n{prev}\n\n"
-        "请：\n"
-        "1. 逐项核对验收条件\n"
-        "2. 评估整体质量\n"
-        "3. 给出明确结论：【验收通过】或【需返工】\n"
-        "   - 若【验收通过】：写一份交付总结\n"
-        "   - 若【需返工】：列出具体问题，说明要哪个角色重做什么\n"
+        "你是项目总监，做最终验收。\n目标：{goal}\n\n所有输出：\n{prev}\n\n"
+        "逐项核对验收条件，给出明确结论：【验收通过】或【需返工】（需返工时说明具体问题）。"
     ),
-    "team-lead-final": (
-        "你是团队负责人（Team Lead）。项目已完成，以下是完整交付物：\n\n"
-        "{prev}\n\n"
-        "原始目标：{goal}\n\n"
-        "请写一份面向用户的**交付报告**：\n"
-        "1. 项目完成情况摘要\n"
-        "2. 主要交付物（如有代码，完整列出）\n"
-        "3. 使用说明\n"
-        "4. 后续建议\n"
-        "语言简明，对用户友好。"
+    "team-lead-summary": (
+        "你是团队负责人（Team Lead）。项目已完成，完整交付物如下：\n\n{prev}\n\n"
+        "用户原始目标：{goal}\n\n"
+        "请写一份面向用户的交付报告：完成情况摘要、主要交付物（代码完整列出）、使用说明、后续建议。"
+        "语言友好简明，这就是你回复用户的最终内容。"
     ),
 }
 
-# 标准流水线步骤定义
-# step: (agent_id, prompt_key, label)
-def build_pipeline_steps(goal: str) -> list[dict]:
-    """根据目标关键词智能选择流程（是否包含后端）"""
+def _build_steps(goal: str) -> list[dict]:
+    """根据目标动态决定需要哪些 Agent"""
     needs_backend = any(w in goal for w in ["后端","API","数据库","服务器","接口","登录","认证","存储"])
-    needs_design  = any(w in goal for w in ["游戏","网页","界面","UI","前端","可视化","动画"])
-
+    needs_design  = any(w in goal for w in ["游戏","网页","界面","UI","前端","可视化","动画","页面"])
     steps = [
-        {"agent_id": "team-lead",        "prompt_key": "team-lead-start",        "label": "📋 理解目标，起草启动令"},
-        {"agent_id": "project-director", "prompt_key": "project-director-plan",  "label": "🎯 制定项目计划"},
-        {"agent_id": "product-manager",  "prompt_key": "product-manager",        "label": "📝 编写产品需求"},
-        {"agent_id": "architect",        "prompt_key": "architect",              "label": "🏗️  设计技术方案"},
+        {"agent": "team-lead",        "prompt_key": "team-lead-kickoff",        "label": "拆解目标，起草启动令"},
+        {"agent": "project-director", "prompt_key": "project-director",         "label": "制定项目计划"},
+        {"agent": "product-manager",  "prompt_key": "product-manager",          "label": "编写产品需求"},
+        {"agent": "architect",        "prompt_key": "architect",                "label": "设计技术方案"},
     ]
     if needs_design:
-        steps.append({"agent_id": "designer", "prompt_key": "designer", "label": "🎨 UI/UX 设计方案"})
+        steps.append({"agent": "designer", "prompt_key": "designer", "label": "UI/UX 设计"})
     if needs_backend:
-        steps.append({"agent_id": "backend-engineer", "prompt_key": "backend-engineer", "label": "⚙️  后端开发"})
-
+        steps.append({"agent": "backend-engineer", "prompt_key": "backend-engineer", "label": "后端开发"})
     steps += [
-        {"agent_id": "frontend-engineer", "prompt_key": "frontend-engineer",         "label": "⚛️  前端开发"},
-        {"agent_id": "qa-tester",         "prompt_key": "qa-tester",                 "label": "🧪 测试 & 质检"},
-        {"agent_id": "project-director",  "prompt_key": "project-director-review",   "label": "🎯 项目总监验收"},
-        {"agent_id": "team-lead",         "prompt_key": "team-lead-final",           "label": "👑 汇总交付报告"},
+        {"agent": "frontend-engineer", "prompt_key": "frontend-engineer",       "label": "前端开发"},
+        {"agent": "qa-tester",         "prompt_key": "qa-tester",               "label": "测试 & 质检"},
+        {"agent": "project-director",  "prompt_key": "project-director-review", "label": "项目总监验收"},
+        {"agent": "team-lead",         "prompt_key": "team-lead-summary",       "label": "汇总，回复用户"},
     ]
     return steps
 
-# SSE 事件队列 — pipeline_id → list[Queue]
-_pipeline_subscribers: dict[str, list[queue.Queue]] = {}
-_pipeline_lock = threading.Lock()
 
-def _publish(pipeline_id: str, event: dict) -> None:
-    """向所有订阅该 pipeline 的 SSE 连接推送事件"""
-    with _pipeline_lock:
-        qs = _pipeline_subscribers.get(pipeline_id, [])
+# SSE 订阅管理（以 chat session id 为 key）
+_tl_subscribers: dict[str, list[queue.Queue]] = {}
+_tl_lock = threading.Lock()
+
+def _tl_publish(session_id: str, event: dict) -> None:
+    with _tl_lock:
+        qs = list(_tl_subscribers.get(session_id, []))
     for q in qs:
         try: q.put_nowait(event)
         except queue.Full: pass
 
-def _subscribe(pipeline_id: str) -> queue.Queue:
-    q = queue.Queue(maxsize=200)
-    with _pipeline_lock:
-        _pipeline_subscribers.setdefault(pipeline_id, []).append(q)
+def _tl_subscribe(session_id: str) -> "queue.Queue[dict]":
+    q: queue.Queue[dict] = queue.Queue(maxsize=300)
+    with _tl_lock:
+        _tl_subscribers.setdefault(session_id, []).append(q)
     return q
 
-def _unsubscribe(pipeline_id: str, q: queue.Queue) -> None:
-    with _pipeline_lock:
-        subs = _pipeline_subscribers.get(pipeline_id, [])
+def _tl_unsubscribe(session_id: str, q: "queue.Queue[dict]") -> None:
+    with _tl_lock:
+        subs = _tl_subscribers.get(session_id, [])
         if q in subs: subs.remove(q)
 
-def run_pipeline(pipeline_id: str, goal: str) -> None:
-    """在后台线程中运行完整自动流水线"""
-    steps    = build_pipeline_steps(goal)
-    outputs  = []   # 各步骤输出列表，逐步累积
-    retried  = False
 
-    _publish(pipeline_id, {"type":"start","pipeline_id":pipeline_id,
-                            "goal":goal,"total_steps":len(steps),"timestamp":time.time()})
+def _run_delegation(session_id: str, goal: str) -> None:
+    """后台线程：team-lead 自动分工协作"""
+    steps   = _build_steps(goal)
+    outputs: list[dict] = []   # {"agent": id, "output": str}
+    retried = False
 
-    db_exec("INSERT INTO pipelines(id,goal,status,created_at) VALUES(?,?,?,?)",
-            (pipeline_id, goal, "running", time.time()))
+    _tl_publish(session_id, {
+        "type": "start", "goal": goal,
+        "total": len(steps), "timestamp": time.time(),
+    })
 
     step_idx = 0
     while step_idx < len(steps):
-        step      = steps[step_idx]
-        agent_id  = step["agent_id"]
-        label     = step["label"]
-        agent_meta= AGENT_META.get(agent_id, {"name": agent_id, "icon": "🤖"})
+        step     = steps[step_idx]
+        agent_id = step["agent"]
+        label    = step["label"]
+        am       = AGENT_META.get(agent_id, {"name": agent_id, "icon": "🤖", "color": "#818cf8"})
 
         # 构建累积上下文
         prev_ctx = "\n\n".join(
-            f"【{AGENT_META.get(o['agent_id'],{}).get('name',o['agent_id'])} 输出】\n{o['output']}"
+            f"【{AGENT_META.get(o['agent'],{}).get('name', o['agent'])} 输出】\n{o['output']}"
             for o in outputs
-        )
-        prompt = ROLE_PROMPTS[step["prompt_key"]].format(goal=goal, prev=prev_ctx or "(无前序输出)")
+        ) or "(无前序输出)"
 
-        _publish(pipeline_id, {
-            "type": "step_start", "step_index": step_idx,
-            "agent_id": agent_id, "agent_name": agent_meta["name"],
-            "agent_icon": agent_meta["icon"], "label": label,
+        prompt = DELEGATION_PROMPTS[step["prompt_key"]].format(goal=goal, prev=prev_ctx)
+
+        _tl_publish(session_id, {
+            "type": "step_start", "step": step_idx, "total": len(steps),
+            "agent_id": agent_id, "agent_name": am["name"],
+            "agent_icon": am["icon"], "agent_color": am.get("color","#818cf8"),
+            "label": label, "timestamp": time.time(),
+        })
+
+        success, output = _run_hermes(agent_id, prompt)
+        append_chat_message(agent_id, "user",      prompt)
+        append_chat_message(agent_id, "assistant", output)
+        track_activity(agent_id)
+
+        outputs.append({"agent": agent_id, "output": output})
+
+        _tl_publish(session_id, {
+            "type": "step_done", "step": step_idx, "total": len(steps),
+            "agent_id": agent_id, "agent_name": am["name"],
+            "agent_icon": am["icon"], "agent_color": am.get("color","#818cf8"),
+            "label": label, "output": output, "success": success,
             "timestamp": time.time(),
         })
 
-        db_exec(
-            "INSERT INTO pipeline_steps(pipeline_id,step_index,agent_id,role_prompt,input,status,started_at)"
-            " VALUES(?,?,?,?,?,?,?)",
-            (pipeline_id, step_idx, agent_id, step["prompt_key"], prompt, "running", time.time()))
-
-        result   = call_agent(agent_id, prompt)
-        output   = result["response"]
-        success  = result["success"]
-
-        db_exec(
-            "UPDATE pipeline_steps SET output=?,status=?,finished_at=? "
-            "WHERE pipeline_id=? AND step_index=?",
-            (output, "done" if success else "error", time.time(), pipeline_id, step_idx))
-
-        outputs.append({"agent_id": agent_id, "prompt_key": step["prompt_key"], "output": output})
-
-        _publish(pipeline_id, {
-            "type": "step_done", "step_index": step_idx,
-            "agent_id": agent_id, "agent_name": agent_meta["name"],
-            "agent_icon": agent_meta["icon"], "label": label,
-            "output": output, "success": success, "timestamp": time.time(),
-        })
-
-        # project-director 审核：若未通过且还没重试过，退回 engineer 重做
+        # project-director 验收：若不通过且未重试，退回 engineer
         if step["prompt_key"] == "project-director-review" and not retried:
-            if "需返工" in output or "需要返工" in output or "不通过" in output:
+            if any(kw in output for kw in ["需返工","需要返工","不通过","reject","Reject"]):
                 retried = True
-                # 找最近的 engineer 步骤，重新插入流程
-                engineer_steps = [s for s in steps if "engineer" in s["agent_id"]]
-                if engineer_steps:
-                    rework_step = dict(engineer_steps[-1])
-                    rework_step["label"] = f"🔁 {rework_step['label']} (返工)"
-                    steps.insert(step_idx + 1, rework_step)        # 插入返工步骤
-                    steps.insert(step_idx + 2, dict(steps[step_idx]))  # 再次审核
-                    _publish(pipeline_id, {
-                        "type": "rework", "step_index": step_idx,
-                        "rework_agent": rework_step["agent_id"],
-                        "reason": "审核未通过，自动触发返工", "timestamp": time.time(),
+                eng_steps = [s for s in steps if "engineer" in s["agent"]]
+                if eng_steps:
+                    rework = dict(eng_steps[-1])
+                    rework["label"] = f"🔁 {rework['label']}（返工）"
+                    steps.insert(step_idx + 1, rework)
+                    steps.insert(step_idx + 2, dict(steps[step_idx]))
+                    _tl_publish(session_id, {
+                        "type": "rework",
+                        "reason": "验收未通过，自动退回重做",
+                        "timestamp": time.time(),
                     })
 
         step_idx += 1
 
-    # 流水线完成
-    final_output = outputs[-1]["output"] if outputs else ""
-    db_exec("UPDATE pipelines SET status='done',finished_at=? WHERE id=?",
-            (time.time(), pipeline_id))
-    _publish(pipeline_id, {
-        "type": "done", "pipeline_id": pipeline_id,
-        "final_output": final_output, "total_steps": len(steps),
-        "timestamp": time.time(),
+    # 最终输出 = team-lead 的汇总（最后一步）
+    final = outputs[-1]["output"] if outputs else "（无输出）"
+
+    # 存入 team-lead 的聊天历史，用户在聊天窗口看到的最终回复
+    append_chat_message("team-lead", "user",      goal)
+    append_chat_message("team-lead", "assistant", final)
+
+    _tl_publish(session_id, {
+        "type": "done", "final": final, "timestamp": time.time(),
     })
 
-def start_pipeline(goal: str) -> str:
-    pipeline_id = str(uuid.uuid4())
-    t = threading.Thread(target=run_pipeline, args=(pipeline_id, goal), daemon=True)
+
+def start_delegation(goal: str) -> str:
+    """启动 team-lead 自动分工，返回 session_id 供 SSE 订阅"""
+    session_id = str(uuid.uuid4())
+    t = threading.Thread(target=_run_delegation, args=(session_id, goal), daemon=True)
     t.start()
-    return pipeline_id
+    return session_id
+
+
+# 保留旧接口兼容（非 team-lead 的 pipeline）
+def start_pipeline(goal: str) -> str:
+    return start_delegation(goal)
 
 # ─── Kanban DB Queries ────────────────────────────────────────────────────────
 
@@ -700,6 +640,12 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self._sse_stream(pid)
             return
 
+        # team-lead 分工 SSE 流
+        elif re.match(r"^/api/chat/team-lead/stream/[\w-]+$", path):
+            session_id = path.split("/")[-1]
+            self._tl_sse_stream(session_id)
+            return
+
         elif path in ("/","/index.html"):     self.serve_file("index.html","text/html")
         else:                                  super().do_GET()
 
@@ -716,6 +662,12 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             if aid not in AGENT_IDS: self.send_json({"success":False,"error":f"未知Agent: {aid}"},404); return
             body = self.read_body(); msg = (body.get("message") or "").strip()
             if not msg: self.send_json({"success":False,"error":"message 不能为空"},400); return
+            # team-lead 自动分工：返回 SSE stream url，前端实时看进度
+            if aid == "team-lead":
+                session_id = start_delegation(msg)
+                self.send_json({"success":True,"delegating":True,
+                                "session_id":session_id,
+                                "stream_url":f"/api/chat/team-lead/stream/{session_id}"}); return
             self.send_json(call_agent(aid, msg)); return
 
         # Forward
@@ -752,6 +704,30 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         self.send_json({"success":False,"error":"未找到"},404)
 
     # ── SSE Stream ────────────────────────────────────────────────────────────
+
+    def _tl_sse_stream(self, session_id: str) -> None:
+        """team-lead 分工过程的 SSE 实时推送"""
+        self.send_response(200)
+        self.send_header("Content-Type",              "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control",             "no-cache")
+        self.send_header("X-Accel-Buffering",         "no")
+        self.send_header("Access-Control-Allow-Origin", self._cors_origin())
+        self.end_headers()
+
+        q = _tl_subscribe(session_id)
+        try:
+            while True:
+                try:
+                    event = q.get(timeout=25)
+                    self._sse_write(event)
+                    if event.get("type") == "done":
+                        break
+                except queue.Empty:
+                    self._sse_write({"type": "heartbeat", "timestamp": time.time()})
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            _tl_unsubscribe(session_id, q)
 
     def _sse_stream(self, pipeline_id: str) -> None:
         """Server-Sent Events：实时推送流水线进度"""
