@@ -1,0 +1,3 @@
+# Hermes Kanban Dashboard
+# No third-party dependencies — pure Python stdlib
+# Python 3.10+ required (uses http.server, sqlite3, subprocess, json, etc.)
